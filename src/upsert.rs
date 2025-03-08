@@ -72,7 +72,7 @@ struct PineconeUpsertRequest {
 #[derive(Debug, Serialize, Deserialize)]
 struct OpenAIEmbeddingRequest {
     model: String,
-    input: Vec<String>,
+    input: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,7 +99,7 @@ async fn generate_embedding(content: &str) -> Result<Vec<f32>, AppError> {
     
     let request = OpenAIEmbeddingRequest {
         model,
-        input: vec![content.to_string()],
+        input: content.to_string(),
     };
     
     let response = client.post("https://api.openai.com/v1/embeddings")

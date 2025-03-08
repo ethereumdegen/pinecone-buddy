@@ -16,6 +16,9 @@ walkdir = "2.3"
 dotenv = "0.15"
 thiserror = "1.0"
 ignore = "0.4"
+uuid = { version = "1.5", features = ["v4"] }
+chrono = "0.4"
+regex = "1.10"
 
 
 

@@ -4,12 +4,27 @@ A simple command-line tool that processes files in a directory and uploads them 
 
 ## Features
 
+### Upload Features
 - Recursively process all files in a specified directory
 - Respects .gitignore patterns and other git ignore rules (skips ignored files)
 - Generate vector embeddings using OpenAI's embedding models
 - Automatically resizes embeddings to match your Pinecone index dimensions
 - Upload embeddings to Pinecone in batches
 - Store metadata with each vector (filename, content type, relative path)
+- Intelligent text chunking for better search results
+- Smart chunk boundary detection using natural text breaks
+- Configurable chunk size and overlap parameters
+- Proper metadata for chunks including original file path and chunk information
+
+### Query Features
+- Smart content retrieval with parallel processing for better performance
+- Content caching to avoid repeated file reads
+- Proper handling of different file types
+- Intelligent base directory detection for relative paths
+- Enhanced context formatting for better AI responses
+- Query tracing with unique IDs and timestamps for auditing
+- Production-ready error handling and recovery
+- Advanced prompt engineering for better context utilization
 
 ## Installation
 
@@ -35,32 +50,42 @@ A simple command-line tool that processes files in a directory and uploads them 
 To upload files from a folder to Pinecone:
 
 ```
-cargo run --bin upsert -f /path/to/your/folder
+cargo run --bin upsert -- -f /path/to/your/folder
 ```
 
-or
+You can customize the chunking behavior with additional options:
 
 ```
-cargo run --bin upsert --folder /path/to/your/folder
+cargo run --bin upsert -- --folder /path/to/your/folder --chunk-size 2000 --chunk-overlap 250
 ```
+
+Options:
+- `-f, --folder`: Path to the folder containing files to process (required)
+- `-s, --chunk-size`: Maximum size of each chunk in characters (default: 1500)
+- `-o, --chunk-overlap`: Overlap between chunks in characters (default: 200)
 
 ### Querying with context from Pinecone
 
 To query OpenAI GPT-4o with context from documents stored in Pinecone:
 
 ```
-cargo run --bin query -q "Your question here?"
+cargo run --bin query -- -q "Your question here?"
 ```
 
 or
 
 ```
-cargo run --bin query --query "Your question here?" --top-k 10
+cargo run --bin query -- --query "Your question here?" --top-k 10
 ```
 
 
  
 
+
+
+```
+cargo run --bin query -- --query "tell me about the advantages of vector embeddings "  
+```
 
 
 

@@ -9,6 +9,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
+use regex::Regex;
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Upload folder contents to Pinecone as vector embeddings")]
@@ -16,6 +18,14 @@ struct Args {
     /// Path to the folder containing files to process
     #[arg(short, long)]
     folder: String,
+    
+    /// Maximum size of each chunk in characters (default: 1500)
+    #[arg(short = 's', long, default_value = "1500")]
+    chunk_size: usize,
+    
+    /// Overlap between chunks in characters (default: 200)
+    #[arg(short = 'o', long, default_value = "200")]
+    chunk_overlap: usize,
 }
 
 #[derive(Debug, Error)]
@@ -48,6 +58,9 @@ struct PineconeMetadata {
     filename: String,
     content_type: String,
     path: String,
+    chunk_index: usize,
+    total_chunks: usize,
+    chunk_text: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,7 +220,78 @@ fn read_file_content(path: &PathBuf) -> Result<String, AppError> {
     }
 }
 
-async fn process_folder(folder_path: &str) -> Result<(), AppError> {
+/// Split text into chunks with a specified size and overlap
+fn chunk_text(text: &str, chunk_size: usize, chunk_overlap: usize) -> Vec<String> {
+    if text.len() <= chunk_size {
+        return vec![text.to_string()];
+    }
+    
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    
+    // Define pattern for paragraph breaks
+    let paragraph_breaks = Regex::new(r"\n\s*\n").unwrap();
+    
+    while start < text.len() {
+        let mut end = std::cmp::min(start + chunk_size, text.len());
+        
+        // If we're not at the end of the text, try to find a natural break point
+        if end < text.len() {
+            // Look for paragraph breaks within the chunk_size from the end
+            let search_start = if end > 100 { end - 100 } else { start };
+            let chunk_text = &text[search_start..end];
+            
+            if let Some(mat) = paragraph_breaks.find_iter(chunk_text).last() {
+                // Found paragraph break, adjust end position
+                end = search_start + mat.end();
+            } else {
+                // No paragraph break found, look for sentence boundaries
+                // We'll manually search for periods, exclamation points, and question marks 
+                // followed by whitespace
+                let end_text = &text[search_start..end];
+                let mut found_sentence_end = false;
+                
+                // Try to find the last sentence end in the search window
+                for i in (0..end_text.len()).rev() {
+                    // Check if character at position i is a sentence-ending punctuation
+                    if i + 1 < end_text.len() && 
+                       (end_text.chars().nth(i) == Some('.') || 
+                        end_text.chars().nth(i) == Some('!') || 
+                        end_text.chars().nth(i) == Some('?')) && 
+                       end_text.chars().nth(i + 1) == Some(' ') {
+                        // Found a sentence boundary
+                        end = search_start + i + 2; // Include the space after punctuation
+                        found_sentence_end = true;
+                        break;
+                    }
+                }
+                
+                // If no sentence boundary found, fall back to word boundary (space)
+                if !found_sentence_end {
+                    if let Some(last_space) = text[start..end].rfind(' ') {
+                        end = start + last_space + 1;
+                    }
+                }
+            }
+        }
+        
+        // Extract the chunk and add to results
+        chunks.push(text[start..end].to_string());
+        
+        // Adjust start for next chunk, considering overlap
+        start = if end == text.len() {
+            // We've reached the end
+            end
+        } else {
+            // Move back by overlap amount, but ensure we're making forward progress
+            std::cmp::max(start + 1, end - chunk_overlap)
+        };
+    }
+    
+    chunks
+}
+
+async fn process_folder(folder_path: &str, chunk_size: usize, chunk_overlap: usize) -> Result<(), AppError> {
     let folder = PathBuf::from(folder_path);
     
     if !folder.exists() || !folder.is_dir() {
@@ -243,7 +327,7 @@ async fn process_folder(folder_path: &str) -> Result<(), AppError> {
             println!("Processing file: {}", path.display());
             
             let content = read_file_content(&path.to_path_buf())?;
-            let embedding = generate_embedding(&content).await?;
+            let content_type = get_content_type(&path.to_path_buf());
             
             let relative_path = path.strip_prefix(&folder)
                 .unwrap_or(path)
@@ -255,28 +339,77 @@ async fn process_folder(folder_path: &str) -> Result<(), AppError> {
                 .unwrap_or("unknown")
                 .to_string();
             
-            let vector = PineconeVector {
-                id: relative_path.clone(),
-                values: embedding,
-                metadata: PineconeMetadata {
-                    filename,
-                    content_type: get_content_type(&path.to_path_buf()),
-                    path: relative_path,
-                },
-            };
-            
-            vectors.push(vector);
-            
-            // Batch uploads in chunks of 100 vectors
-            if vectors.len() >= 100 {
-                upsert_to_pinecone(vectors).await?;
-                vectors = Vec::new();
+            // For text files, split into chunks
+            if content_type == "text" {
+                let chunks = chunk_text(&content, chunk_size, chunk_overlap);
+                println!("  Split into {} chunks", chunks.len());
+                
+                // Process each chunk
+                for (chunk_index, chunk) in chunks.iter().enumerate() {
+                    let embedding = generate_embedding(chunk).await?;
+                    
+                    // Create a unique ID for each chunk
+                    let chunk_id = format!("{}#chunk{}", relative_path, chunk_index);
+                    
+                    let vector = PineconeVector {
+                        id: chunk_id,
+                        values: embedding,
+                        metadata: PineconeMetadata {
+                            filename: filename.clone(),
+                            content_type: content_type.clone(),
+                            path: relative_path.clone(),
+                            chunk_index,
+                            total_chunks: chunks.len(),
+                            // Store a preview of the chunk text (limited to 500 chars)
+                            chunk_text: if chunk.len() > 500 {
+                                format!("{}...", &chunk[0..500])
+                            } else {
+                                chunk.clone()
+                            },
+                        },
+                    };
+                    
+                    vectors.push(vector);
+                    
+                    // Batch uploads in chunks of 100 vectors
+                    if vectors.len() >= 100 {
+                        println!("  Upserting batch of {} vectors to Pinecone...", vectors.len());
+                        upsert_to_pinecone(vectors).await?;
+                        vectors = Vec::new();
+                    }
+                }
+            } else {
+                // For non-text files, just create a single vector
+                let embedding = generate_embedding(&content).await?;
+                
+                let vector = PineconeVector {
+                    id: relative_path.clone(),
+                    values: embedding,
+                    metadata: PineconeMetadata {
+                        filename,
+                        content_type,
+                        path: relative_path,
+                        chunk_index: 0,
+                        total_chunks: 1,
+                        chunk_text: content.clone(),
+                    },
+                };
+                
+                vectors.push(vector);
+                
+                // Batch uploads in chunks of 100 vectors
+                if vectors.len() >= 100 {
+                    println!("  Upserting batch of {} vectors to Pinecone...", vectors.len());
+                    upsert_to_pinecone(vectors).await?;
+                    vectors = Vec::new();
+                }
             }
         }
     }
     
     // Upload any remaining vectors
     if !vectors.is_empty() {
+        println!("  Upserting final batch of {} vectors to Pinecone...", vectors.len());
         upsert_to_pinecone(vectors).await?;
     }
     
@@ -290,8 +423,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     
     println!("Processing folder: {}", args.folder);
+    println!("Chunk size: {} characters with {} character overlap", args.chunk_size, args.chunk_overlap);
     
-    process_folder(&args.folder)
+    process_folder(&args.folder, args.chunk_size, args.chunk_overlap)
         .await
         .context("Failed to process folder")?;
     
